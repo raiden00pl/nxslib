@@ -12,12 +12,13 @@ import numpy as np
 
 from nxslib.comm import CommHandler
 from nxslib.logger import logger
-from nxslib.proto.iparse import dsfmt_get
+from nxslib.proto.iparse import ParseAck, dsfmt_get
 from nxslib.thread import ThreadCommon
 
 if TYPE_CHECKING:
     from nxslib.dev import Device, DeviceChannel
     from nxslib.intf.iintf import ICommInterface
+    from nxslib.plugin import INxscopePlugin
     from nxslib.proto.iparse import DParseStreamNumpy, ICommParse
 
 
@@ -210,6 +211,9 @@ class NxscopeHandler:
         self._queue_lock: Lock = Lock()
 
         self._stream_started: bool = False
+
+        self._plugins: dict[str, tuple["INxscopePlugin", int | None]] = {}
+        self._plugins_lock: Lock = Lock()
 
         self._ovf_cntr: int = 0
         self._stats_lock: Lock = Lock()
@@ -423,11 +427,25 @@ class NxscopeHandler:
         self._sub_q = [[] for _ in range(self.dev.data.chmax)]
         self._connected = True
 
+        with self._plugins_lock:
+            plugins = [p for p, _ in self._plugins.values()]
+        for plugin in plugins:
+            cb = getattr(plugin, "on_connect", None)
+            if callable(cb):
+                cb(self.dev)
+
         return self._comm.dev
 
     def disconnect(self) -> None:
         """Disconnect from a NxScope device."""
         if self._connected is True:
+            with self._plugins_lock:
+                plugins = [p for p, _ in self._plugins.values()]
+            for plugin in plugins:
+                cb = getattr(plugin, "on_disconnect", None)
+                if callable(cb):
+                    cb()
+
             # stop stream
             self.stream_stop()
             # disable all channels now
@@ -435,6 +453,84 @@ class NxscopeHandler:
             # disconnect
             self._comm.disconnect()
             self._connected = False
+
+    def send_user_frame(
+        self,
+        fid: int,
+        payload: bytes,
+        ack_mode: str = "auto",
+        ack_timeout: float = 1.0,
+    ) -> ParseAck:
+        """Send user-defined frame through nxscope transport."""
+        return self._comm.send_user_frame(
+            fid, payload, ack_mode=ack_mode, ack_timeout=ack_timeout
+        )
+
+    def add_user_frame_listener(
+        self,
+        callback: Any,
+        frame_ids: list[int] | tuple[int, ...] | set[int] | None = None,
+    ) -> int:
+        """Register callback for user-defined frames."""
+        return self._comm.add_user_frame_listener(callback, frame_ids)
+
+    def remove_user_frame_listener(self, listener_id: int) -> bool:
+        """Unregister callback for user-defined frames."""
+        return self._comm.remove_user_frame_listener(listener_id)
+
+    def register_plugin(
+        self,
+        plugin: "INxscopePlugin",
+        frame_ids: list[int] | tuple[int, ...] | set[int] | None = None,
+    ) -> str:
+        """Register plugin and optional user-frame handler."""
+        name = getattr(plugin, "name", plugin.__class__.__name__)
+        listener_id: int | None = None
+
+        with self._plugins_lock:
+            if name in self._plugins:
+                raise ValueError(f"plugin already registered: {name}")
+
+            cb = getattr(plugin, "on_user_frame", None)
+            if callable(cb):
+                listener_id = self.add_user_frame_listener(cb, frame_ids)
+            self._plugins[name] = (plugin, listener_id)
+
+        try:
+            cb_register = getattr(plugin, "on_register", None)
+            if callable(cb_register):
+                cb_register(self)
+
+            if self.connected and self.dev is not None:
+                cb_connect = getattr(plugin, "on_connect", None)
+                if callable(cb_connect):
+                    cb_connect(self.dev)
+        except Exception:
+            self.unregister_plugin(name)
+            raise
+
+        return name
+
+    def unregister_plugin(self, name: str) -> bool:
+        """Unregister plugin by name."""
+        with self._plugins_lock:
+            if name not in self._plugins:
+                return False
+            plugin, listener_id = self._plugins.pop(name)
+
+        if listener_id is not None:
+            self.remove_user_frame_listener(listener_id)
+
+        if self.connected:
+            cb_disconnect = getattr(plugin, "on_disconnect", None)
+            if callable(cb_disconnect):
+                cb_disconnect()
+
+        cb_unregister = getattr(plugin, "on_unregister", None)
+        if callable(cb_unregister):
+            cb_unregister()
+
+        return True
 
     def dev_channel_get(self, chid: int) -> "DeviceChannel | None":
         """Get a channel info.

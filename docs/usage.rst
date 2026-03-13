@@ -123,6 +123,55 @@ All interface classes support the context manager protocol:
 Communication handler
 ---------------------
 
+User extensions and plugins
+^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+Nxslib supports user-defined NxScope frame IDs (IDs ``>= 8``) for protocol
+extensions.
+
+Sending a user frame:
+
+.. code-block:: python
+
+   ack = nxscope.send_user_frame(
+       8,                       # user frame ID
+       b"\x01\x02\x03",         # payload
+       ack_mode="auto",         # auto | required | disabled
+       ack_timeout=1.0,
+   )
+
+Receiving user frames with a callback:
+
+.. code-block:: python
+
+   def on_user_frame(frame):
+       print(frame.fid, frame.data)
+       return True  # handled
+
+   listener_id = nxscope.add_user_frame_listener(on_user_frame, frame_ids=[8])
+   # ...
+   nxscope.remove_user_frame_listener(listener_id)
+
+Plugin registration API:
+
+.. code-block:: python
+
+   from nxslib.plugin import INxscopePlugin
+
+   class MyPlugin(INxscopePlugin):
+       name = "my_plugin"
+
+       def on_register(self, nxscope):
+           self.nxscope = nxscope
+
+       def on_user_frame(self, frame):
+           return False
+
+   plugin = MyPlugin()
+   nxscope.register_plugin(plugin, frame_ids=[8, 9])
+   # ...
+   nxscope.unregister_plugin("my_plugin")
+
 Parser
 ^^^^^^
 

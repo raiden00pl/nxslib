@@ -6,6 +6,8 @@ import pytest  # type: ignore
 
 from nxslib.intf.dummy import DummyDev
 from nxslib.nxscope import DNxscopeStream, NxscopeHandler
+from nxslib.plugin import INxscopePlugin
+from nxslib.proto.iframe import DParseFrame
 from nxslib.proto.parse import Parser
 
 
@@ -783,3 +785,169 @@ def test_thread1_handles_transient_empty():
     assert nxscope.unsub == 3
     stream_started.clear()
     stream_stop.clear()
+
+
+def test_nxscope_plugin_lifecycle_and_user_api():
+    class TestPlugin(INxscopePlugin):
+        name = "test_plugin"
+
+        def __init__(self):
+            self.events = []
+
+        def on_register(self, nxscope):
+            self.events.append("register")
+
+        def on_unregister(self):
+            self.events.append("unregister")
+
+        def on_connect(self, dev):
+            del dev
+            self.events.append("connect")
+
+        def on_disconnect(self):
+            self.events.append("disconnect")
+
+        def on_user_frame(self, frame):
+            self.events.append(f"user:{int(frame.fid)}")
+            return True
+
+    intf = DummyDev(thread_timeout=0.05)
+    parse = Parser()
+    plugin = TestPlugin()
+
+    nxscope = NxscopeHandler(
+        intf, parse, drop_timeout=0.01, stream_data_timeout=0.05
+    )
+
+    nxscope.register_plugin(plugin, frame_ids=[8])
+    assert "register" in plugin.events
+
+    nxscope.connect()
+    assert "connect" in plugin.events
+    assert (
+        nxscope._comm._dispatch_user_frame(DParseFrame(fid=8, data=b"\x01"))
+        is True
+    )
+    assert "user:8" in plugin.events
+
+    calls = []
+
+    def fake_send(
+        fid, payload, ack_mode="auto", ack_timeout=1.0
+    ):  # pragma: no cover
+        calls.append((fid, payload, ack_mode, ack_timeout))
+        return None
+
+    nxscope._comm.send_user_frame = fake_send  # type: ignore[attr-defined]
+    nxscope.send_user_frame(8, b"\x11\x22", ack_mode="disabled")
+    assert calls == [(8, b"\x11\x22", "disabled", 1.0)]
+
+    nxscope.disconnect()
+    assert "disconnect" in plugin.events
+
+    assert nxscope.unregister_plugin("test_plugin") is True
+    assert "unregister" in plugin.events
+    assert nxscope.unregister_plugin("test_plugin") is False
+
+
+def test_nxscope_plugin_default_interface():
+    plugin = INxscopePlugin()
+    assert plugin.on_register(None) is None  # type: ignore[arg-type]
+    assert plugin.on_unregister() is None
+    assert plugin.on_connect(None) is None  # type: ignore[arg-type]
+    assert plugin.on_disconnect() is None
+    assert plugin.on_user_frame(DParseFrame(fid=8, data=b"\x00")) is False
+
+
+def test_nxscope_plugin_register_duplicate_and_rollback():
+    class DuplicatePlugin(INxscopePlugin):
+        name = "dup"
+
+    class FailingPlugin(INxscopePlugin):
+        name = "fail"
+
+        def __init__(self):
+            self.events = []
+
+        def on_register(self, nxscope):
+            del nxscope
+            self.events.append("register")
+            raise RuntimeError("boom")
+
+        def on_unregister(self):
+            self.events.append("unregister")
+
+    intf = DummyDev(thread_timeout=0.05)
+    parse = Parser()
+    nxscope = NxscopeHandler(
+        intf, parse, drop_timeout=0.01, stream_data_timeout=0.05
+    )
+
+    nxscope.register_plugin(DuplicatePlugin())
+    with pytest.raises(ValueError):
+        nxscope.register_plugin(DuplicatePlugin())
+    assert nxscope.unregister_plugin("dup") is True
+
+    failing = FailingPlugin()
+    with pytest.raises(RuntimeError):
+        nxscope.register_plugin(failing)
+    assert failing.events == ["register", "unregister"]
+    assert nxscope.unregister_plugin("fail") is False
+
+
+def test_nxscope_plugin_noncallable_hooks_and_connected_unregister():
+    class BarePlugin:
+        name = "bare"
+        on_register = None
+        on_unregister = None
+        on_connect = None
+        on_disconnect = None
+        on_user_frame = None
+
+    class DisconnectPlugin(INxscopePlugin):
+        name = "disc"
+
+        def __init__(self):
+            self.events = []
+
+        def on_disconnect(self):
+            self.events.append("disconnect")
+
+    intf = DummyDev(thread_timeout=0.05)
+    parse = Parser()
+    nxscope = NxscopeHandler(
+        intf, parse, drop_timeout=0.01, stream_data_timeout=0.05
+    )
+
+    nxscope.connect()
+    nxscope.register_plugin(BarePlugin())  # type: ignore[arg-type]
+    assert nxscope.unregister_plugin("bare") is True
+    nxscope.disconnect()
+
+    nxscope.connect()
+    disc = DisconnectPlugin()
+    nxscope.register_plugin(disc)
+    assert nxscope.unregister_plugin("disc") is True
+    assert disc.events == ["disconnect"]
+    nxscope.disconnect()
+
+
+def test_nxscope_connect_disconnect_noncallable_plugin_hooks():
+    class BarePlugin:
+        name = "bare_connect"
+        on_register = None
+        on_unregister = None
+        on_connect = None
+        on_disconnect = None
+        on_user_frame = None
+
+    intf = DummyDev(thread_timeout=0.05)
+    parse = Parser()
+    nxscope = NxscopeHandler(
+        intf, parse, drop_timeout=0.01, stream_data_timeout=0.05
+    )
+
+    nxscope.register_plugin(BarePlugin())  # type: ignore[arg-type]
+    nxscope.connect()
+    nxscope.disconnect()
+    assert nxscope.unregister_plugin("bare_connect") is True
